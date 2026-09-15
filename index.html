@@ -194,7 +194,8 @@
           <select id="qualitySelect" class="bg-slate-800 border border-slate-700 text-[11px] text-slate-300 rounded-lg px-1.5 py-1 outline-none focus:border-brand-500">
             <option value="mp3">标准 (MP3)</option>
             <option value="exhigh">高品质 (320K)</option>
-            <option value="flac" selected>无损 (FLAC)</option>
+            <option value="exhigh" selected>高品质 (320K)</option>
+            <option value="flac">无损 (FLAC)</option>
           </select>
           <button id="downloadSongBtn" class="bg-slate-800 hover:bg-slate-700 active:scale-95 text-[11px] text-slate-300 border border-slate-700 rounded-lg px-2.5 py-1 flex items-center space-x-1 transition">
             <svg class="w-3 h-3 text-brand-400" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M16.5 12L12 16.5m0 0L7.5 12m4.5 4.5V3"/></svg>
@@ -260,6 +261,21 @@
       const txt = document.createElement("textarea");
       txt.innerHTML = html;
       return txt.value;
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? '').replace(/[&<>"']/g, char => ({
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        '"': '&quot;',
+        "'": '&#39;',
+      })[char]);
+    }
+
+    function safeResourceUrl(value) {
+      const url = String(value ?? '').trim();
+      return /^(https?:|data:image\/)/i.test(url) ? escapeHtml(url) : '';
     }
 
     function formatTime(seconds) {
@@ -414,6 +430,14 @@
     let unlockArmed = false;        // "静音自动播放"兜底后是否已挂起"首次交互开声"监听
     let autoplayMuted = false;      // 是否处于静音自动播放兜底状态（页面尚未获得有声播放授权）
     const kuwoHitCache = new Map(); // 酷我匹配结果内存缓存（同曲重试/换榜复用，零重复请求）
+    const RANK_BATCH_SIZE = 30;     // 榜单首次只匹配 30 首，滚动到底部再继续
+    const AUDIO_LOAD_TIMEOUT_MS = 10000;
+    const AUDIO_SWITCH_DELAY_MS = 700;
+    let audioLoadToken = 0;
+    let audioLoadTimer = null;
+    let audioSwitchTimer = null;
+    const audioFailureRound = new Set();
+    let temporaryNoticeUntil = 0;
 
     // ========== 主题切换 ==========
     function setTheme(isDark) {
@@ -452,7 +476,14 @@
         text = text.substring(text.indexOf('(') + 1, text.lastIndexOf(')'));
       }
       let res;
-      try { res = JSON.parse(text); } catch(e) { res = eval('(' + text + ')'); }
+      try {
+        res = JSON.parse(text);
+      } catch(e) {
+        throw new Error('音乐接口返回了无法解析的数据');
+      }
+      if (!res || !Array.isArray(res.abslist)) {
+        throw new Error('音乐接口返回格式异常');
+      }
       const songs = res.abslist.map(_ => ({
         // 存储纯数字 ID（去掉 MUSIC_ 前缀）
         id: _.MUSICRID.replace("MUSIC_", ""),
@@ -681,6 +712,7 @@
     async function loadSearchList() {
       rankShuffleMode = false; // 搜索/随机模式按列表顺序连播
       rankToken++; // 切换到搜索，使进行中的榜单批次失效
+      audioFailureRound.clear();
       listTitle.innerText = randomPlayMode ? `🎲 随机歌单：${currentQuery}` : '搜索结果';
       setRankTabActive(null);
       rankMoreWrap.classList.add('hidden');
@@ -734,6 +766,7 @@
       rankLoading = false;
       playlist = [];
       rankLoaded = 0;
+      audioFailureRound.clear();
       // 命中缓存：直接秒出，跳过网络匹配（整单洗牌随机播放，每次打开顺序不同）
       const cached = loadRankCache(bangKey);
       if (cached) {
@@ -754,7 +787,7 @@
         }
         pageIndicator.innerText = `共 ${rankTracks.length} 首`;
         rankTracks = shuffleArray(rankTracks); // 整单洗牌后匹配，首批开播即为随机歌曲
-        await loadRankingAll();
+        await loadRankingBatch();
       } catch (err) {
         console.error(err);
         musicList.innerHTML = `<div class="text-center text-red-400 py-8 px-4 text-xs">${cfg.name}加载失败，请检查代理</div>`;
@@ -767,10 +800,10 @@
       return `
         <div data-index="${idx}" class="flex items-center justify-between p-2.5 cursor-pointer transition ${isActive ? 'bg-brand-600/15 border-l-4 border-brand-500' : 'hover:bg-slate-800/40'}">
           <div class="flex items-center space-x-2.5 min-w-0 flex-1">
-            <img src="${song.thumb || song.artwork || DEFAULT_COVER}" loading="lazy" decoding="async" class="w-8 h-8 rounded object-cover bg-slate-800 shrink-0">
+            <img src="${safeResourceUrl(song.thumb || song.artwork || DEFAULT_COVER)}" loading="lazy" decoding="async" class="w-8 h-8 rounded object-cover bg-slate-800 shrink-0">
             <div class="min-w-0 flex-1">
-              <p class="text-base font-semibold truncate ${isActive ? 'text-brand-400' : 'text-slate-100'}">${song.title}</p>
-              <p class="text-xs text-slate-400 truncate">${song.artist} - ${song.album || '未知专辑'}</p>
+              <p class="text-base font-semibold truncate ${isActive ? 'text-brand-400' : 'text-slate-100'}">${escapeHtml(song.title)}</p>
+              <p class="text-xs text-slate-400 truncate">${escapeHtml(song.artist)} - ${escapeHtml(song.album || '未知专辑')}</p>
             </div>
           </div>
           <span class="text-[10px] text-slate-500 shrink-0 ml-2">点击播放</span>
@@ -799,45 +832,50 @@
       }
     }
 
-    // 默认全量加载榜单：边匹配边渲染（流式），自动加载全部歌曲，不做数量限制
-    async function loadRankingAll() {
-      if (rankLoading) return;
+    // 分批匹配榜单：首次 30 首，滚动到底部或点击“加载更多”再继续
+    async function loadRankingBatch() {
+      if (rankLoading || currentMode !== 'rank' || rankLoaded >= rankTracks.length) return;
       rankLoading = true;
+      rankMoreBtn.disabled = true;
+      rankMoreBtn.innerText = '加载中...';
       const token = rankToken;
-      const all = rankTracks;
+      const batchStart = rankLoaded;
+      const batch = rankTracks.slice(batchStart, batchStart + RANK_BATCH_SIZE);
+
+      if (playlist.length === 0) {
+        musicList.innerHTML = `<div class="text-center text-slate-400 py-12 text-xs">🎯 正在匹配${BANG_CONFIG[currentBangKey].name}（0 / ${rankTracks.length}），请稍候...</div>`;
+      }
+
       try {
-        musicList.innerHTML = `<div class="text-center text-slate-400 py-12 text-xs">🎯 正在匹配${BANG_CONFIG[currentBangKey].name}（0 / ${all.length}），请稍候...</div>`;
-        playlist = [];
-        let offset = 0;
-        while (offset < all.length) {
-          if (token !== rankToken) return;
-          const batch = all.slice(offset, offset + 15);
-          const songs = await mapLimit(batch, 15, async t => {
-            const first = await findKuwoSong(t.name, t.artist);
-            if (first) return first;
-            return await findKuwoSong(t.name, t.artist); // 匹配失败重试一次
-          });
-          if (token !== rankToken) return; // 榜单已切换/已搜索，丢弃本次结果
-          const hits = songs.filter(Boolean);
-          if (hits.length) {
-            const startIdx = playlist.length;
-            playlist = playlist.concat(hits);
-            if (startIdx === 0) {
-              musicList.innerHTML = hits.map(rankRowHtml).join('');
-              // 首批匹配完成立即开播，剩余歌曲后台继续流式追加
-              playSong(0);
-            } else {
-              musicList.insertAdjacentHTML('beforeend', hits.map((s, i) => rankRowHtml(s, startIdx + i)).join(''));
-            }
+        const songs = await mapLimit(batch, 15, async t => {
+          const first = await findKuwoSong(t.name, t.artist);
+          if (first) return first;
+          return await findKuwoSong(t.name, t.artist); // 匹配失败重试一次
+        });
+        if (token !== rankToken) return;
+
+        const hits = songs.filter(Boolean);
+        const startIdx = playlist.length;
+        if (hits.length) {
+          playlist = playlist.concat(hits);
+          if (startIdx === 0) {
+            musicList.innerHTML = hits.map(rankRowHtml).join('');
+            playSong(0);
+          } else {
+            musicList.insertAdjacentHTML('beforeend', hits.map((s, i) => rankRowHtml(s, startIdx + i)).join(''));
           }
-          offset += batch.length;
-          pageIndicator.innerText = `已匹配 ${offset} / ${all.length}`;
+        } else if (startIdx === 0) {
+          musicList.innerHTML = '<div class="text-center text-slate-500 py-12 text-xs">本批未匹配到歌曲，点击下方继续加载</div>';
         }
-        if (playlist.length) {
+
+        rankLoaded = batchStart + batch.length;
+        const done = rankLoaded >= rankTracks.length;
+        pageIndicator.innerText = `已加载 ${playlist.length} 首 · 已匹配 ${rankLoaded} / ${rankTracks.length}`;
+        rankMoreWrap.classList.toggle('hidden', done);
+
+        if (done && playlist.length) {
           pageIndicator.innerText = `共 ${playlist.length} 首`;
-          saveRankCache(currentBangKey, playlist); // 匹配完成立即写缓存，下次秒出
-        } else {
-          musicList.innerHTML = '<div class="text-center text-slate-500 py-12 text-xs">榜单歌曲匹配失败 😭</div>';
+          saveRankCache(currentBangKey, playlist);
         }
       } catch (err) {
         console.error(err);
@@ -846,6 +884,8 @@
         }
       } finally {
         rankLoading = false;
+        rankMoreBtn.disabled = false;
+        rankMoreBtn.innerText = '加载更多';
       }
     }
 
@@ -855,10 +895,10 @@
         return `
           <div data-index="${idx}" class="flex items-center justify-between p-2.5 cursor-pointer transition ${isActive ? 'bg-brand-600/15 border-l-4 border-brand-500' : 'hover:bg-slate-800/40'}">
             <div class="flex items-center space-x-2.5 min-w-0 flex-1">
-              <img src="${song.thumb || song.artwork || DEFAULT_COVER}" loading="lazy" decoding="async" class="w-8 h-8 rounded object-cover bg-slate-800 shrink-0">
+              <img src="${safeResourceUrl(song.thumb || song.artwork || DEFAULT_COVER)}" loading="lazy" decoding="async" class="w-8 h-8 rounded object-cover bg-slate-800 shrink-0">
               <div class="min-w-0 flex-1">
-                <p class="text-base font-semibold truncate ${isActive ? 'text-brand-400' : 'text-slate-100'}">${song.title}</p>
-                <p class="text-xs text-slate-400 truncate">${song.artist} - ${song.album || '未知专辑'}</p>
+                <p class="text-base font-semibold truncate ${isActive ? 'text-brand-400' : 'text-slate-100'}">${escapeHtml(song.title)}</p>
+                <p class="text-xs text-slate-400 truncate">${escapeHtml(song.artist)} - ${escapeHtml(song.album || '未知专辑')}</p>
               </div>
             </div>
             <span class="text-[10px] text-slate-500 shrink-0 ml-2">点击播放</span>
@@ -876,7 +916,7 @@
       }
       const rows = lyrics.map((line, idx) => `
         <div id="lyric-line-${idx}" data-time="${line.time}" class="lyric-line py-1 px-1.5 text-center text-base md:text-xl text-slate-500 font-medium transition-all duration-200 cursor-pointer hover:text-white rounded">
-          ${line.text}
+          ${escapeHtml(line.text)}
         </div>
       `).join('');
       if (lyricsContainer) lyricsContainer.innerHTML = rows;
@@ -951,8 +991,79 @@
       document.addEventListener('touchend', unlock);
     }
 
+    function clearAudioLoadTimer() {
+      if (audioLoadTimer) {
+        clearTimeout(audioLoadTimer);
+        audioLoadTimer = null;
+      }
+    }
+
+    function clearAudioSwitchTimer() {
+      if (audioSwitchTimer) {
+        clearTimeout(audioSwitchTimer);
+        audioSwitchTimer = null;
+      }
+    }
+
+    function setMiniLyricText(text, force = false) {
+      if (!force && Date.now() < temporaryNoticeUntil) return;
+      miniLyricText.innerText = text;
+    }
+
+    function showTemporaryNotice(text, duration = 1800) {
+      temporaryNoticeUntil = Date.now() + duration;
+      miniLyricText.innerText = text;
+    }
+
+    function markAudioReady() {
+      if (audioPlayer.dataset.loadToken !== String(audioLoadToken)) return;
+      clearAudioLoadTimer();
+      clearAudioSwitchTimer();
+      if (currentIndex >= 0) audioFailureRound.delete(currentIndex);
+    }
+
+    function findNextPlayableIndex() {
+      if (!playlist.length) return -1;
+      for (let step = 1; step <= playlist.length; step++) {
+        const idx = (currentIndex + step) % playlist.length;
+        if (!audioFailureRound.has(idx)) return idx;
+      }
+      return -1;
+    }
+
+    function handleAudioUnavailable(token, immediate = false) {
+      if (String(token) !== String(audioLoadToken)) return;
+      if (audioPlayer.readyState >= 2 || audioPlayer.currentTime > 0.5) {
+        markAudioReady();
+        return;
+      }
+
+      clearAudioLoadTimer();
+      clearAudioSwitchTimer();
+      if (currentIndex >= 0) audioFailureRound.add(currentIndex);
+      updatePlayButtonState(false);
+
+      const next = findNextPlayableIndex();
+      if (next === -1) {
+        showTemporaryNotice('暂时没有可播放的歌曲', 3000);
+        return;
+      }
+
+      showTemporaryNotice('当前歌曲不可用，已切换下一首');
+      audioSwitchTimer = setTimeout(() => {
+        if (String(token) !== String(audioLoadToken)) return;
+        if (audioPlayer.readyState >= 2 || audioPlayer.currentTime > 0.5) {
+          markAudioReady();
+          return;
+        }
+        playSong(next);
+      }, immediate ? 250 : AUDIO_SWITCH_DELAY_MS);
+    }
+
     async function playSong(idx, openLyric = false) {
       if (idx < 0 || idx >= playlist.length) return;
+      clearAudioLoadTimer();
+      clearAudioSwitchTimer();
       currentIndex = idx;
       const song = playlist[currentIndex];
       renderPlaylist();
@@ -970,7 +1081,12 @@
       qualityFall = 0; // 每首重置：允许无损→高品质→标准逐级降档
       // 播放 URL 用纯数字 ID
       const playUrl = `https://music.nxinxz.com/kw.php?id=${encodeURIComponent(song.id)}&level=${apiLevel}&type=mp3`;
+      const loadToken = String(++audioLoadToken);
+      audioPlayer.dataset.loadToken = loadToken;
+      audioPlayer.preload = 'auto';
       audioPlayer.src = playUrl;
+      audioPlayer.load();
+      audioLoadTimer = setTimeout(() => handleAudioUnavailable(loadToken), AUDIO_LOAD_TIMEOUT_MS);
       // 浏览器自动播放策略：页面尚无用户手势时"有声"play() 会被拒绝。
       // 策略：先尝试有声播放；被拒则自动降级为静音播放（muted 自动播放被允许），
       // 音乐立即开始走动，提示"点击任意处开启声音"，首次交互后开声、进度不打断。
@@ -982,7 +1098,7 @@
             audioPlayer.muted = true;
             autoplayMuted = true;
             try { await audioPlayer.play(); } catch(e2) { console.error('静音自动播放也被拦截', e2); }
-            miniLyricText.innerText = '🔇 已静音自动播放 · 点击任意处开启声音';
+            setMiniLyricText('🔇 已静音自动播放 · 点击任意处开启声音');
             updatePlayButtonState(true);
             armSoundUnlock();
           });
@@ -990,7 +1106,7 @@
       } catch(err) {
         audioPlayer.muted = true;
         autoplayMuted = true;
-        miniLyricText.innerText = '🔇 已静音自动播放 · 点击任意处开启声音';
+        setMiniLyricText('🔇 已静音自动播放 · 点击任意处开启声音');
         armSoundUnlock();
       }
       updatePlayButtonState(true);
@@ -1000,7 +1116,7 @@
 
       // ====== 加载歌词 ======
       lastActiveIdx = -1;
-      miniLyricText.innerText = "⏳ 正在加载歌词...";
+      setMiniLyricText("⏳ 正在加载歌词...");
       lyricsContainer.innerHTML = '<div class="text-center text-slate-500 py-8 text-xs">正在加载歌词...</div>';
       if (lyricPageContainer) lyricPageContainer.innerHTML = '<div class="text-center text-slate-500 py-8 text-xs">正在加载歌词...</div>';
       downloadLrcBtn.classList.add('hidden');
@@ -1008,18 +1124,19 @@
 
       // 传纯数字 ID
       const rawLyrics = await fetchLyrics(song.id, song.title, song.artist);
+      if (loadToken !== String(audioLoadToken)) return;
       console.log('🎵 歌词解析结果:', rawLyrics);
 
       if (rawLyrics && rawLyrics.length > 0) {
         lyrics = rawLyrics;
         renderLyrics();
         downloadLrcBtn.classList.remove('hidden');
-        miniLyricText.innerText = `🎵 ${song.title} - ${song.artist}`;
+        setMiniLyricText(`🎵 ${song.title} - ${song.artist}`);
         console.log('✅ 歌词加载成功，共', lyrics.length, '行');
       } else {
         lyricsContainer.innerHTML = '<div class="text-center text-slate-600 py-8 text-xs">暂无歌词</div>';
         if (lyricPageContainer) lyricPageContainer.innerHTML = '<div class="text-center text-slate-600 py-8 text-xs">暂无歌词</div>';
-        miniLyricText.innerText = "🔇 暂无歌词";
+        setMiniLyricText("🔇 暂无歌词");
         console.warn('❌ 歌词加载失败');
       }
 
@@ -1078,6 +1195,10 @@
     }
 
     // ========== 音频事件 ==========
+    audioPlayer.onloadedmetadata = markAudioReady;
+    audioPlayer.oncanplay = markAudioReady;
+    audioPlayer.onplaying = markAudioReady;
+
     audioPlayer.ontimeupdate = () => {
       const cur = audioPlayer.currentTime;
       const dur = audioPlayer.duration || 0;
@@ -1095,7 +1216,7 @@
         if (activeIdx !== lastActiveIdx) {
           lastActiveIdx = activeIdx;
           const line = lyrics[activeIdx];
-          miniLyricText.innerText = line.text ? `🎤 ${line.text}` : "🎵 ...";
+          setMiniLyricText(line.text ? `🎤 ${line.text}` : "🎵 ...");
           applyLyricHighlight(activeIdx);
         }
       }
@@ -1123,7 +1244,7 @@
       }
     };
 
-    // 音质逐级降档：无损→高品质→标准（个别歌曲无更高音质源时自动兼容）
+    // 音质逐级降档：无损→高品质→标准；降无可降时自动切换下一首
     audioPlayer.onerror = () => {
       if (currentIndex === -1) return;
       const LADDER = ['flac', 'exhigh', 'mp3']; // option value 档位顺序：无损→高品质→标准
@@ -1133,6 +1254,8 @@
         const t = audioPlayer.currentTime || 0;
         qualitySelect.value = LADDER[pos + 1];
         playSong(currentIndex).then(() => { try { audioPlayer.currentTime = t; } catch (e) {} });
+      } else {
+        handleAudioUnavailable(audioPlayer.dataset.loadToken, true);
       }
     };
 
@@ -1144,8 +1267,18 @@
     rankNewBtn.onclick = () => loadRanking('new');
     musicList.addEventListener('click', e => {
       const row = e.target.closest('[data-index]');
-      if (row) playSong(parseInt(row.dataset.index, 10));
+      if (row) {
+        const idx = parseInt(row.dataset.index, 10);
+        audioFailureRound.delete(idx);
+        playSong(idx);
+      }
     });
+    musicList.addEventListener('scroll', () => {
+      if (currentMode !== 'rank' || rankLoaded >= rankTracks.length) return;
+      const remaining = musicList.scrollHeight - musicList.scrollTop - musicList.clientHeight;
+      if (remaining < 160) loadRankingBatch();
+    }, { passive: true });
+    rankMoreBtn.onclick = loadRankingBatch;
     prevPageBtn.onclick = async () => { if(currentPage > 1) { currentPage--; await loadSearchList(); } };
     nextPageBtn.onclick = async () => { currentPage++; await loadSearchList(); };
     playBtn.onclick = () => {
@@ -1155,8 +1288,18 @@
         else { audioPlayer.pause(); updatePlayButtonState(false); }
       }
     };
-    prevBtn.onclick = () => { if(playlist.length) playSong(currentIndex > 0 ? currentIndex - 1 : playlist.length - 1); };
-    nextBtn.onclick = () => { if(playlist.length) playSong(currentIndex < playlist.length - 1 ? currentIndex + 1 : 0); };
+    prevBtn.onclick = () => {
+      if (!playlist.length) return;
+      const idx = currentIndex > 0 ? currentIndex - 1 : playlist.length - 1;
+      audioFailureRound.delete(idx);
+      playSong(idx);
+    };
+    nextBtn.onclick = () => {
+      if (!playlist.length) return;
+      const idx = currentIndex < playlist.length - 1 ? currentIndex + 1 : 0;
+      audioFailureRound.delete(idx);
+      playSong(idx);
+    };
     progressContainer.onclick = e => {
       if (!audioPlayer.duration) return;
       const rect = progressContainer.getBoundingClientRect();
@@ -1249,7 +1392,7 @@
 
     // ========== 初始化 ==========
     initTheme();
-    qualitySelect.value = 'flac'; // 音质默认自动选择无损（接口无无损源时自动降级标准）
+    qualitySelect.value = 'exhigh'; // 默认高品质，必要时自动降级到标准 MP3
     playerCover.src = DEFAULT_COVER;
     playerCover.onerror = function() { this.src = DEFAULT_COVER; };
 
