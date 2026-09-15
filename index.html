@@ -301,41 +301,52 @@
     const DEFAULT_COVER = getDefaultCover();
 
     // ========== CORS 代理管理器（多层备用 + 自动重试）==========
+// ========== CORS 代理管理器（多层备用 + 自动重试）==========
 const PROXY_CHAIN = [
-  url => \`https://corsproxy.io/?\${encodeURIComponent(url)}\`,
-  url => \`https://api.allorigins.win/raw?url=\${encodeURIComponent(url)}\`,
-  url => \`https://jsnzkpg4.pages.dev/\${encodeURIComponent(url)}\`,
+  (url) => 'https://jsnzkpg4.pages.dev/' + url,
+  (url) => 'https://corsproxy.io/?' + encodeURIComponent(url),
+  (url) => 'https://api.allorigins.win/raw?url=' + encodeURIComponent(url),
 ];
 
 async function proxyFetch(url, options = {}, maxRetries = 2) {
-  // 用户自定义代理优先级最高
   const customProxy = localStorage.getItem('music_cors_proxy');
-  const userProxyFn = customProxy ? (u => {
+  if (customProxy) {
     const base = customProxy.endsWith('/') ? customProxy : customProxy + '/';
-    return base + u;
-  }) : null;
-
-  const attempts = [];
-  if (userProxyFn) attempts.push(userProxyFn(url));
-  attempts.push(...PROXY_CHAIN.map(fn => fn(url)));
-
-  // 去重
-  const uniqueUrls = [...new Set(attempts)];
-
-  let lastError = null;
-  for (let i = 0; i < Math.min(uniqueUrls.length, maxRetries + 1); i++) {
     try {
       const ctrl = new AbortController();
       const timer = setTimeout(() => ctrl.abort(), 15000);
-      const res = await fetch(uniqueUrls[i], { ...options, signal: ctrl.signal });
+      const res = await fetch(base + url, { ...options, signal: ctrl.signal });
       clearTimeout(timer);
-      if (!res.ok) throw new Error(\`HTTP \${res.status}\`);
-      console.log(\`✅ 代理成功: \${uniqueUrls[i].slice(0, 60)}\`);
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      console.log('✅ 自定义代理成功:', url.slice(0, 60));
+      return res;
+    } catch(e) {
+      console.warn('⚠️ 自定义代理失败:', e.message);
+    }
+  }
+
+  const attempts = PROXY_CHAIN.map(fn => fn(url));
+  let lastError = null;
+  for (let i = 0; i < Math.min(attempts.length, maxRetries + 1); i++) {
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 15000);
+      const res = await fetch(attempts[i], { ...options, signal: ctrl.signal });
+      clearTimeout(timer);
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      console.log('✅ 代理成功 [' + (i+1) + ']:', attempts[i].slice(0, 60));
       return res;
     } catch(e) {
       lastError = e;
-      console.warn(\`⚠️ 代理失败 [\${i+1}]: \${e.message}\`);
+      console.warn('⚠️ 代理失败 [' + (i+1) + ']:', e.message);
     }
+  }
+  throw lastError;
+}
+
+function getProxyUrl(url) {
+  return PROXY_CHAIN[0](url);
+}
   }
   throw lastError;
 }
@@ -478,7 +489,7 @@ function getProxyUrl(url) {
     // ========== API ==========
     async function searchMusic(query, page, rn = 30) {
       const url = `http://search.kuwo.cn/r.s?client=kt&all=${encodeURIComponent(query)}&pn=${page - 1}&rn=${rn}&uid=2574109560&ver=kwplayer_ar_8.5.4.2&vipver=1&ft=music&cluster=0&strategy=2012&encoding=utf8&rformat=json&vermerge=1&mobi=1`;
-      const response = await proxyFetch(url));
+      const response = await proxyFetch(url);
       let text = await response.text();
       if (text.startsWith('callback(') || text.startsWith('jsonp(')) {
         text = text.substring(text.indexOf('(') + 1, text.lastIndexOf(')'));
@@ -524,7 +535,7 @@ function getProxyUrl(url) {
     async function fetchRankingTracks(bangKey) {
       const cfg = BANG_CONFIG[bangKey];
       const url = `https://music.163.com/api/playlist/detail?id=${cfg.listId}`;
-      const response = await proxyFetch(url));
+      const response = await proxyFetch(url);
       const res = await response.json();
       return (res.result?.tracks || []).map(t => ({
         name: t.name,
@@ -589,7 +600,7 @@ function getProxyUrl(url) {
       const url = `http://m.kuwo.cn/newh5/singles/songinfoandlrc?musicId=${songId}&httpStatus=1`;
       console.log('📡 [酷我] 请求歌词 URL:', url);
       try {
-        const response = await proxyFetch(url));
+        const response = await proxyFetch(url);
         const res = await response.json();
         const rawList = res.data?.lrclist || [];
         if (rawList.length === 0) {
@@ -618,14 +629,14 @@ function getProxyUrl(url) {
       const searchUrl = `https://music.163.com/api/search/get/web?s=${encodeURIComponent(query)}&type=1&limit=1`;
       console.log('📡 [网易云] 搜索歌词 URL:', searchUrl);
       try {
-        const res = await proxyFetch(searchUrl));
+        const res = await proxyFetch(searchUrl);
         const data = await res.json();
         const songs = data?.result?.songs || [];
         if (songs.length === 0) { console.warn('⚠️ [网易云] 未找到歌曲'); return null; }
         const id = songs[0].id;
         console.log('📡 [网易云] 获取歌词 ID:', id);
         const lrcUrl = `https://music.163.com/api/song/lyric?id=${id}&lv=1`;
-        const lrcRes = await proxyFetch(lrcUrl));
+        const lrcRes = await proxyFetch(lrcUrl);
         const lrcData = await lrcRes.json();
         const lrc = lrcData?.lrc?.lyric || '';
         if (!lrc) { console.warn('⚠️ [网易云] 无歌词'); return null; }
@@ -656,7 +667,7 @@ function getProxyUrl(url) {
     async function fetchHighResArtwork(songId) {
       const url = `http://m.kuwo.cn/newh5/singles/songinfoandlrc?musicId=${songId}&httpStatus=1`;
       try {
-        const response = await proxyFetch(url));
+        const response = await proxyFetch(url);
         const res = await response.json();
         const originalUrl = res.data?.songinfo?.pic;
         if (originalUrl) {
