@@ -347,18 +347,10 @@ async function proxyFetch(url, options = {}, maxRetries = 2) {
 function getProxyUrl(url) {
   return PROXY_CHAIN[0](url);
 }
-  }
-  throw lastError;
+// fetch 带超时，防止个别慢请求挂死整批加载
+async function fetchWithTimeout(url, ms = 15000) {
+  return proxyFetch(url, {}, Math.ceil(ms / 5000));
 }
-
-function getProxyUrl(url) {
-  return PROXY_CHAIN[0](url);
-}
-
-    // fetch 带超时，防止个别慢请求挂死整批加载
-    async function fetchWithTimeout(url, ms = 15000) {
-      return proxyFetch(url, {}, Math.ceil(ms / 5000));
-    }
 
     // 榜单匹配结果缓存（localStorage，每天更新）：当天首次打开强制拉取最新榜单，
     // 同一天内重复打开命中缓存秒出、跳过网络匹配；跨天后自动失效重新匹配
